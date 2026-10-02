@@ -61,6 +61,11 @@ team_t team = {
 #define PREV_PTR(bp) (PREV_OFF(bp) ? (uint32_t *)(base_ptr + PREV_OFF(bp)) : NULL)
 #define NEXT_PTR(bp) (NEXT_OFF(bp) ? (uint32_t *)(base_ptr + NEXT_OFF(bp)) : NULL)
 
+#define PREV_BLOCK(bp) (FLAG(bp) ? NULL : (char *)(bp) - SIZE((char *)(bp) - 4))
+#define NEXT_BLOCK(bp) ((char *)(bp) + SIZE(bp))
+
+#define IS_FREE(bp) (!FLAG(NEXT_BLOCK(bp)))
+
 typedef struct {
     uint32_t size;
     uint32_t head;
@@ -69,11 +74,10 @@ typedef struct {
 static Class *classes;
 static char* base_ptr;
 
-#define CLASS_COUNT 16
+#define CLASS_COUNT 15
 #define CLASS_SIZES \
-    16, 32, 48, 64, 80, 96, 112, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768
-
-#define CHUNKSIZE 4096
+    16, 32, 40, 72, 88, 128, 248, 488, 968, 1928, 3848, 7688, 15368, 30728, 61448
+#define CHUNKSIZE 0
 
  /* 
  *
@@ -170,56 +174,58 @@ void remove_node(char *ptr){
     if(NEXT_PTR(ptr)) PREV_OFF(NEXT_PTR(ptr)) = PREV_OFF(ptr);
 }
 
-char* coalesce(char *block_ptr){
-    u_int32_t flag = FLAG(block_ptr);
-    u_int32_t size = SIZE(block_ptr);
-    u_int32_t next_size = SIZE(block_ptr + size);
-    u_int32_t prev_size = SIZE(block_ptr - 4);;
-    if(next_size && !(HEADER(block_ptr + size + next_size) & 0b1)){
-        if(next_size >= 16)remove_node(block_ptr + size);
+// block_ptr에는 유효한 header가 있고, next_block도 유효하다. (에필로그 포함)
+char *free_block(char *block_ptr){
+    uint32_t size = SIZE(block_ptr);
+    char *next_ptr = NEXT_BLOCK(block_ptr);
+    char *prev_ptr = PREV_BLOCK(block_ptr);
+    if (!SIZE(next_ptr) == 0 && IS_FREE(next_ptr)) {
+        uint32_t next_size = SIZE(next_ptr);
+        if (next_size >= 16) remove_node(next_ptr);
         size += next_size;
-        HEADER(block_ptr) = size | flag;
     }
-    if(!(HEADER(block_ptr) & 0b1)){
+    if (prev_ptr) {
+        uint32_t prev_size = SIZE(prev_ptr);
+        if (prev_size >= 16) remove_node(prev_ptr);
         size += prev_size;
-        block_ptr -= prev_size;
-        if(prev_size >= 16)remove_node(block_ptr);
-        HEADER(block_ptr) = size | 0b1;
+        block_ptr = prev_ptr;
     }
-    FOOTER(block_ptr, size) = size | 0b1;
-    insert_node(block_ptr);
+    uint32_t flag = FLAG(block_ptr);
+    HEADER(block_ptr) = size | flag;
+    FOOTER(block_ptr, size) = size | flag;
+    HEADER(NEXT_BLOCK(block_ptr)) &= ~0b1;
+    if (size >= 16)insert_node(block_ptr);
     return block_ptr;
-};
+}
+
+static inline void alloc_block(char *bp, uint32_t size){
+    uint32_t flag = FLAG(bp);
+    HEADER(bp) = size | flag;
+    HEADER(NEXT_BLOCK(bp)) |= 0b1;
+}
 
 void split_block(char *block_ptr, uint32_t total_size, uint32_t new_size){
-    uint32_t flag = FLAG(block_ptr);
     uint32_t remain = total_size - new_size;
-
-    HEADER(block_ptr) = new_size | flag;    
-    if(remain == 0){
-        HEADER(block_ptr + new_size) |= 0b1;
-    }else if(remain < 16){
-        HEADER(block_ptr + new_size) = remain | 0b1;
-        FOOTER(block_ptr + new_size, 8) = remain | 0b1;
-    }else{
-        uint32_t index = get_index(remain);
-
-        HEADER(block_ptr + new_size) = remain | 0b1;
-        PREV_OFF(block_ptr + new_size) = 0;
-        NEXT_OFF(block_ptr + new_size) = classes[index].head;
-        FOOTER(block_ptr + new_size, remain) = remain | 0b1;
-
-        insert_node(block_ptr + new_size);
+    alloc_block(block_ptr, new_size);
+    if (remain) {
+        char *remain_ptr = block_ptr + new_size;
+        HEADER(remain_ptr) = remain | 0b1;
+        free_block(remain_ptr);
     }
 }
 
 void *mm_malloc(size_t size){
     //TODO: 4일 때 푸터 사라지니까 패딩 없이 정렬함으로써 용량을 더 절약할 수 있..나? 고민이 필요함.
     size_t block_size = ALIGN(size + 4); //헤더 들어가야하니까
-    uint32_t block_offset = 0;
-    size_t remain = 0;
-    
     int idx = get_index(block_size);
+    
+    //경계의 90% 이상을 먹으면 그냥 전체 줘버리기.
+    if (idx < CLASS_COUNT - 1) {
+    size_t upper = classes[idx + 1].size - ALIGNMENT;
+
+    if (block_size * 100 >= upper * 80)
+        block_size = upper;
+    }
 
     char *block_ptr = NULL;
     for (int i = idx; i < CLASS_COUNT && block_ptr == NULL; i++){
@@ -236,63 +242,83 @@ void *mm_malloc(size_t size){
         }
     }
     if(block_ptr){
-        size_t total_size = HEADER(block_ptr) & ~0b111;
-        block_offset = block_ptr - base_ptr;
-        remain = total_size - block_size;
-        HEADER(block_ptr) = block_size|0b1; // 헤더
+        uint32_t total_size = SIZE(block_ptr);
+        split_block(block_ptr, total_size, block_size);
+        return block_ptr + 4;
     }else{
-        size_t extend_size = MAX(block_size, CHUNKSIZE);
+        uint32_t extend_size = MAX(block_size, CHUNKSIZE);
         block_ptr = (char*)mem_sbrk(extend_size) - 4;
-        remain = extend_size - block_size;
-        uint32_t prev_alloc = FLAG(block_ptr); // 원래 이전 점유되어 있었는지 체크
-        if(!prev_alloc){
-            uint32_t prev_size = SIZE(block_ptr - 4);
-            char *prev_ptr = block_ptr - prev_size;
-            if(prev_size >= 16)
-                remove_node(prev_ptr);
+        uint32_t total_size = extend_size;
+
+        char *prev_ptr = PREV_BLOCK(block_ptr);
+        if (prev_ptr) {
+            uint32_t prev_size = SIZE(prev_ptr);
+            if (prev_size >= 16)remove_node(prev_ptr);
             block_ptr = prev_ptr;
-            extend_size += prev_size;
-            remain += prev_size;
-            prev_alloc = FLAG(block_ptr);
+            total_size += prev_size;
         }
-        HEADER(block_ptr) = (uint32_t)block_size | prev_alloc;
-        block_offset = (uint32_t)(block_ptr - base_ptr);
-        *(uint32_t *)(block_ptr + extend_size) = 0b0; // 에필로그
+    HEADER(block_ptr + total_size) = 0;
+    split_block(block_ptr, total_size, block_size);
+    return block_ptr + 4;
     }
-    split_block(block_ptr, block_size + remain, block_size);
-    return (char *)block_ptr + 4;
 }
 
 /*
  * mm_free - Freeing a block does nothing.
  */
 void mm_free(void *ptr){
-    ptr -= 4;
-    uint32_t size = SIZE(ptr);
-    HEADER(ptr + size) &= ~0b1;
-    ptr = coalesce(ptr);
+    free_block((char *)ptr - 4);
 }
 
 /*
  * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
  */
-void *mm_realloc(void *ptr, size_t size)
-{
-    void *old_ptr = ptr-4;
-    void *new_ptr;
+void *mm_realloc(void *ptr, size_t size){
+    char *old_ptr = ptr-4;
+    char *new_ptr;
     size_t old_size = SIZE(old_ptr);
     size_t new_size = ALIGN(size+4);
+    char *next_ptr = NEXT_BLOCK(old_ptr);
+    char *prev_ptr = PREV_BLOCK(old_ptr);
+
+    if (size == 0){
+        mm_free(old_ptr);
+    }
+    if (old_size == new_size){
+        return ptr;
+    } 
     if (old_size > new_size){
-        uint32_t remain = old_size - new_size;
-        split_block(old_ptr, old_size, new_size);
+        // split_block(old_ptr, old_size, new_size);
+        // 의도적으로 공간 남기기
         return ptr;
-    } else if (old_size == new_size){
+    } 
+    if (SIZE(next_ptr) && IS_FREE(next_ptr) && old_size + SIZE(next_ptr) >= new_size){
+        if(SIZE(next_ptr) >= 16) remove_node(next_ptr);
+        // split_block(old_ptr, old_size + SIZE(next_ptr), new_size);
+        alloc_block(old_ptr, old_size + SIZE(next_ptr));
         return ptr;
-    } else if (SIZE(old_ptr + old_size) && FLAG(old_ptr + old_size + SIZE(old_ptr + old_size)) == 0 && old_size + SIZE(old_ptr + old_size) >= new_size){
-        uint32_t total_size = old_size + SIZE(old_ptr + old_size);
-        if(SIZE(old_ptr + old_size) >= 16) remove_node(old_ptr + old_size);
-        split_block(old_ptr, total_size, new_size);
+    }
+    if (SIZE(next_ptr) == 0){ //이거랑 아래는 에필로그랑 만나는 경우
+        size_t extend_size = new_size - old_size;
+        mem_sbrk(extend_size);
+        HEADER(next_ptr + extend_size) = 0;
+        split_block(old_ptr, old_size + extend_size, new_size);
         return ptr;
+    }
+    if(IS_FREE(next_ptr) && SIZE(NEXT_BLOCK(next_ptr)) == 0 ){
+        uint32_t block_size = old_size + SIZE(next_ptr);
+        size_t extend_size = MAX(new_size - block_size, 0);
+        mem_sbrk(extend_size);
+        HEADER(next_ptr + extend_size) = 0;
+        // split_block(old_ptr, block_size + extend_size, new_size);
+        alloc_block(old_ptr, block_size + extend_size);
+        return ptr;
+    }
+    if(prev_ptr && IS_FREE(prev_ptr) && SIZE(prev_ptr) + old_size >= new_size){
+        if(SIZE(prev_ptr) >= 16) remove_node(prev_ptr);
+        memmove(prev_ptr + 4, ptr, old_size - 4);
+        split_block(prev_ptr, SIZE(prev_ptr) + old_size, new_size);
+        return prev_ptr + 4;
     }
 
     new_ptr = mm_malloc(size);
