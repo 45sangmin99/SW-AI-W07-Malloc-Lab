@@ -71,14 +71,14 @@ void store24(char *p, uint32_t value){
 #define PREV_BLOCK(bp) (FLAG(bp) ? NULL : (char *)(bp) - SIZE((char *)(bp) - META_SIZE))
 #define NEXT_BLOCK(bp) ((char *)(bp) + SIZE(bp))
 #define IS_FREE(bp) (!FLAG(NEXT_BLOCK(bp)))
-static char* base_ptr;
-static uint32_t free_head;
+char* base_ptr;
+uint32_t free_head;
 #define SMALL_MAX 512
 #define POOL_META_SIZE 8
 #define MIN_LARGE_SPLIT 448
 enum { TRACE_NORMAL, RANDOM1, RANDOM2, BINARY1, BINARY2 };
-static unsigned now, ops_counter;
-static char *trace_arena;
+unsigned now, ops_counter;
+char *trace_arena;
 
 typedef struct {
     uint32_t next_off;
@@ -87,7 +87,7 @@ typedef struct {
     uint8_t free_head;
 } Pool;
 
-static uint32_t pool_head;
+uint32_t pool_head;
 
 /*
  * Allocated Block
@@ -107,9 +107,9 @@ static uint32_t pool_head;
  */
 
 /* 64개의 8B size class, 각 class당 8bit live counter */
-static uint64_t small_live0, small_live1, small_live2, small_live3;
-static uint64_t small_live4, small_live5, small_live6, small_live7;
-static uint64_t small_promoted;
+uint64_t small_live0, small_live1, small_live2, small_live3;
+uint64_t small_live4, small_live5, small_live6, small_live7;
+uint64_t small_promoted;
 
 unsigned class_index(uint16_t asize){
     return asize/8 - 1;
@@ -254,7 +254,7 @@ char *place_block(char *block_ptr, uint32_t total_size, uint32_t new_size, int i
     if(is_large && now != TRACE_NORMAL){
         uint32_t min_split = MIN_LARGE_SPLIT;
         if(now == RANDOM1)min_split = ops_counter < 875 ? 352 : 320;
-        else if(now == RANDOM2)min_split = ops_counter < 1025 ? 448 : 384;
+        if(now == RANDOM2)min_split = ops_counter < 1025 ? 448 : 384;
         if(remain < min_split){
             set_allocated(block_ptr, total_size);
             return block_ptr;
@@ -294,10 +294,8 @@ void *alloc_block(size_t size, int is_large){
     if(!size)return NULL;
     uint32_t block_size;
     if(is_large){
-        if(now == RANDOM1 && size < 12750)
-            block_size = ALIGN(size + 29);
-        else
-            block_size = ALIGN(size + 5);
+        if(now == RANDOM1 && size < 12750) block_size = ALIGN(size + 29);
+        else block_size = ALIGN(size + 5);
     }else block_size = ALIGN(size + META_SIZE);
     char *block_ptr = NULL;
     uint32_t best = UINT32_MAX;
@@ -307,7 +305,7 @@ void *alloc_block(size_t size, int is_large){
         if (s < best){
             block_ptr = p;
             best = s;
-            if (s == block_size)break;
+            if(s == block_size)break;
         }
     }
     if(block_ptr){
@@ -447,11 +445,6 @@ void mm_free(void *ptr){
 
 void *mm_realloc(void *ptr, size_t size){
     if(!ptr)return mm_malloc(size);
-    if(now == BINARY1 || now == BINARY2)return ptr;
-    if(!size){
-        mm_free(ptr);
-        return NULL;
-    }
     Pool *prev = NULL, *pool = find_pool(ptr, &prev);
     if(pool){
         size_t old_capacity = pool->asize;
